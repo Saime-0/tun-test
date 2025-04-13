@@ -3,19 +3,19 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
+	"net"
 	"os/exec"
 	"runtime"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/songgao/packets/ethernet"
 	"github.com/songgao/water"
 	"github.com/songgao/water/waterutil"
 )
 
 func main() {
-	// Что такое tun интерфейс?
-	// На каком уровне находится протокол, как определить протокол пакета в linux
-	// Как в go lang работать с интерфейсами
-
 	if runtime.GOOS != "linux" {
 		log.Fatalf("%s is not supported on this platform", runtime.GOOS)
 	}
@@ -34,55 +34,82 @@ const (
 
 // runTunApp Поднимает tun интерфейс и отправляет туда трафик, сами пакеты из тоннеля считывается, парсится протокол,
 // от кого и кому, по каким портам, логируется полученная информация и байты самого пакета.
-// Требуется:
-//  1. поднять tun интерфейс
-//  2. Направлять трафик в интерфейс
-//  3. Считывать пакеты из тоннеля
-//  4. Получить информацию из пакета:
-//     4.1. Используемый протокол
-//     4.2. Какие порты используются
 //
-// 5. Залогировать полученную информацию и содержимое пакета (байты)
+// Будет выполнено:
+//  1. Поднять tun интерфейс.
+//  2. Направлять трафик в интерфейс.
+//  3. Считывать пакеты из интерфейса:
+//     3.1. Получить информацию из пакета: Используемый протокол; Какие порты используются.
+//     3.2. Залогировать полученную информацию и содержимое пакета (байты).
 func runTunApp() (err error) {
 	var ifce *water.Interface
 	// Инициализировать интерфейс
 	if ifce, err = initTunIfce(); err != nil {
 		return err
 	}
-	//// Установить размер одного пакета
-	//if err = exec.Command("/sbin/ip", "link", "set", "dev", ifce.Name(), "mtu", fmt.Sprint(MTU)).Run(); err != nil {
-	//	return fmt.Errorf("exec.Command: %v", err)
+	// Настроить интерфейс
+	if err = setupIfce(ifce); err != nil {
+		return fmt.Errorf("setupIfce: %v", err)
+	}
+	// Инициализировать подключение
+	//conn, err := initConn()
+	//if err != nil {
+	//	return fmt.Errorf("initConn: %v", err)
 	//}
-	// Назначить адрес интерфейсу ipv4 адрес
-	if err = exec.Command("/sbin/ip", "addr", "add", ifceCIDR, "dev", ifce.Name()).Run(); err != nil {
-		return fmt.Errorf("exec.Command: %v", err)
-	}
-	//// Запретить ipv6
-	//if err = exec.Command("/usr/bin/sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6=0", ifceName)).Run(); err != nil {
-	//	return fmt.Errorf("exec.Command: %v", err)
-	//}
-	// Включить интерфейс
-	if err = exec.Command("/sbin/ip", "link", "set", "dev", ifce.Name(), "up").Run(); err != nil {
-		return fmt.Errorf("exec.Command: %v", err)
-	}
-	// Удалить ipv6 (чтобы не мешал)
-	if err = exec.Command("/sbin/ip", "-6", "addr", "flush", "dev", ifceName).Run(); err != nil {
-		return fmt.Errorf("exec.Command: %v", err)
-	}
-
-	// Начать вычитывать траффик
-	readFrames(ifce)
-	//readFramesV2(ifce)
+	// Начать вычитывать трафик
+	go readFrames(ifce)
+	// Начать писать трафик
+	//write(conn)
+	writeFrames(ifce)
 
 	return nil
 }
 
-// Источники:
-// Принцип VPN, используя water:
-//	https://github.com/roundliuyang/Computer-Network/blob/3d581ce3dbf41a9ba87cfa82cb510599310c5290/Linux%20%E5%86%85%E6%A0%B8%E7%BD%91%E7%BB%9C%E6%8A%80%E6%9C%AF/VPN%20%E5%8E%9F%E7%90%86.md?plain=1#L90
-// A simple TUN/TAP library written in native Go:
-//	https://github.com/songgao/water
-//
+func writeFrames(ifce *water.Interface) {
+	for range 10 {
+		time.Sleep(1 * time.Second)
+		b := []byte(uuid.NewString())
+		n, err := ifce.Write(b)
+		if err != nil {
+			log.Printf("ERROR writeFrames: ifce.Write: %v", err)
+		}
+		log.Printf("INFO writeFrames: ifce.Write: written %d bytes: % x", n, b)
+	}
+}
+
+func write(conn net.Conn) {
+	for range 10 {
+		time.Sleep(1 * time.Second)
+		data := uuid.NewString()
+		n, err := fmt.Fprintf(conn, data)
+		if err != nil {
+			log.Printf("ERROR write: fmt.Fprintf: %v", err)
+			continue
+		}
+		log.Printf("INFO wrote frame: %d bytes: % x", n, data)
+	}
+}
+
+//func write(conn net.Conn) {
+//	for range 10 {
+//		time.Sleep(1 * time.Second)
+//		b := []byte(uuid.NewString())
+//		n, err := conn.Write(b)
+//		if err != nil {
+//			log.Printf("ERROR write: conn.Write: %v", err)
+//		}
+//		log.Printf("INFO wrote UDP frames: %d bytes: % x", n, b)
+//	}
+//}
+
+func initConn() (net.Conn, error) {
+	conn, err := net.Dial("udp", ifceIP+":42224")
+	if err != nil {
+		return nil, fmt.Errorf("net.Dial: %v", err)
+	}
+
+	return conn, err
+}
 
 // initTunIfce создает виртуальные сетевые интерфейс типа TUN
 func initTunIfce() (*water.Interface, error) {
@@ -99,80 +126,60 @@ func initTunIfce() (*water.Interface, error) {
 	return ifce, nil
 }
 
+// setupIfce настраивает интерфейс посредством утилиты ip
+func setupIfce(ifce *water.Interface) error {
+	// Установить размер одного пакета
+	if err := exec.Command("/sbin/ip", "link", "set", "dev", ifce.Name(), "mtu", fmt.Sprint(MTU)).Run(); err != nil {
+		return fmt.Errorf("exec.Command: %v", err)
+	}
+	// Назначить адрес интерфейсу ipv4 адрес
+	if err := exec.Command("/sbin/ip", "addr", "add", ifceCIDR, "dev", ifce.Name()).Run(); err != nil {
+		return fmt.Errorf("exec.Command: %v", err)
+	}
+	// Включить интерфейс
+	if err := exec.Command("/sbin/ip", "link", "set", "dev", ifce.Name(), "up").Run(); err != nil {
+		return fmt.Errorf("exec.Command: %v", err)
+	}
+	// Удалить ipv6 (чтобы не мешал)
+	if err := exec.Command("/sbin/ip", "-6", "addr", "flush", "dev", ifceName).Run(); err != nil {
+		return fmt.Errorf("exec.Command: %v", err)
+	}
+
+	return nil
+}
+
+// readFrames читает пачками
 func readFrames(ifce *water.Interface) {
 	var frame ethernet.Frame
 	for {
 		frame.Resize(MTU)
 		n, err := ifce.Read(frame)
 		if err != nil {
-			log.Printf("ERROR readFrames: %s", err.Error())
+			log.Printf("ERROR readFrames: %v", err)
 			continue
 		}
 		frame = frame[:n]
-		logFrameV3(frame)
+		logNewFrame(frame)
 	}
 }
 
-func readFramesV2(ifce *water.Interface) {
-	//var frame ethernet.Frame
-	//for {
-	//	frame.Resize(MTU)
-	//	n, err := ifce.Read(frame)
-	//	if err != nil {
-	//		log.Printf("ERROR readFrames: %s", err.Error())
-	//		continue
-	//	}
-	//	frame = frame[:n]
-	//	logFrame(frame)
-	//}
-	buf := make([]byte, MTU)
-	for {
-		n, err := ifce.Read(buf)
-		if err != nil {
-			log.Printf("ERROR readFramesV2: %s", err.Error())
-		}
-		data := buf[:n]
-		//if !waterutil.IsIPv4(data) {
-		//	continue
-		//}
-		logFrameV2(data)
-		//logFrame(data)
-
-		//// 如果目标IP与本地 Tun 设备的IP相同，则将数据包写回到 Tun 设备
-		//if srcIp.Equal(destIp) {
-		//	_, _ = dev.Write(data)
-		//} else {
-		//	// TODO 将数据通过公网发送给服务端进行转发，并将公网响应数据包写入 Tun 设备
-		//	fmt.Println("公网转发")
-		//}
-	}
-}
-
-func logFrame(frame ethernet.Frame) {
-	log.Printf("Dst: %s\n", frame.Destination())
-	log.Printf("Src: %s\n", frame.Source())
-	log.Printf("Протокол: % x\n", frame.Ethertype())
-	log.Printf("Порт назначения: % x\n", waterutil.IPv4DestinationPort(frame))
-	log.Printf("Порт источника: % x\n", waterutil.IPv4SourcePort(frame))
-	log.Printf("Данные: % x\n", frame.Payload())
-}
-
-func logFrameV2(data []byte) {
-	p := waterutil.IPv4Protocol(data)
-	log.Printf("V2: Протокол: %x (%s)\n", p, protocolName[p])
-	log.Printf("V2: Порт назначения: %d\n", waterutil.IPv4DestinationPort(data))
-	log.Printf("V2: Порт источника: %d\n", waterutil.IPv4SourcePort(data))
-	log.Printf("V2: Данные: % x\n", ethernet.Frame(data).Payload())
-}
-
-func logFrameV3(frame ethernet.Frame) {
+// logNewFrame логирует некоторые данные фрейма
+func logNewFrame(frame ethernet.Frame) {
 	p := waterutil.IPv4Protocol(frame)
-	log.Printf("V3: Протокол: %x (%s)\n", p, protocolName[p])
-	log.Printf("V3: Порт назначения: %d\n", waterutil.IPv4DestinationPort(frame))
-	log.Printf("V3: Порт источника: %d\n", waterutil.IPv4SourcePort(frame))
-	log.Printf("V3: Данные: % x\n", frame.Payload())
+	//log.Printf("Протокол: %x (%s)\n", p, protocolName[p])
+	//log.Printf("Порт назначения: %d\n", waterutil.IPv4DestinationPort(frame))
+	//log.Printf("Порт источника: %d\n", waterutil.IPv4SourcePort(frame))
+	//log.Printf("Данные: % x\n", frame.Payload())
+	slog.Info(
+		"logNewFrame",
+		slog.String("Протокол", protocolName[p]),
+		slog.Int("Порт назначения", int(waterutil.IPv4DestinationPort(frame))),
+		slog.Int("Порт источника", int(waterutil.IPv4SourcePort(frame))),
+		slog.String("Данные", fmt.Sprintf("% x", frame.Payload())),
+	)
 }
 
+// readFrames человеко-понятные названия протоколов
 var protocolName = map[waterutil.IPProtocol]string{
 	0x00: "HOPOPT",
 	0x01: "ICMP",
@@ -307,3 +314,10 @@ var protocolName = map[waterutil.IPProtocol]string{
 	0x8B: "HIP",
 	0x8C: "Shim6",
 }
+
+// Источники:
+// Принцип VPN, используя water:
+//	https://github.com/roundliuyang/Computer-Network/blob/3d581ce3dbf41a9ba87cfa82cb510599310c5290/Linux%20%E5%86%85%E6%A0%B8%E7%BD%91%E7%BB%9C%E6%8A%80%E6%9C%AF/VPN%20%E5%8E%9F%E7%90%86.md?plain=1#L90
+// A simple TUN/TAP library written in native Go:
+//	https://github.com/songgao/water
+//
