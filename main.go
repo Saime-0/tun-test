@@ -7,9 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"runtime"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/songgao/packets/ethernet"
 	"github.com/songgao/water"
 	"github.com/songgao/water/waterutil"
@@ -32,13 +30,60 @@ const (
 	ifceCIDR   = ifceIP + "/" + ifceIPMask
 )
 
+// ======= Модель TCP/IP =======
+//
+// Номер | Название уровня                | Протоколы
+//   4   | Application layer (Прикладной) | HTTP, SSH, Telnet, ...
+//   3*  | Transport layer (Транспортный) | TCP, UDP	                    <---- tun находится здесь
+//   2   | Internet layer (Межсетевой)    | IP (IPv4, IPv6), ICMP, IGMP
+//   1   | Link layer (Канальный)         | Ethernet, Wi-Fi, PPP, DSL
+//
+// ==== Транспортный уровень ====
+//
+// IPv4 data unit (packet):                                                              https://pkg.go.dev/github.com/songgao/water/waterutil
+// +---------------------------------------------------------------------------------------------------------------+
+// |       | Octet |           0           |           1           |           2           |           3           |
+// | Octet |  Bit  |00|01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|
+// +---------------------------------------------------------------------------------------------------------------+
+// |   0   |   0   |  Version  |    IHL    |      DSCP       | ECN |                 Total  Length                 |
+// +---------------------------------------------------------------------------------------------------------------+
+// |   4   |  32   |                Identification                 | Flags  |           Fragment Offset            |
+// +---------------------------------------------------------------------------------------------------------------+
+// |   8   |  64   |     Time To Live      |       Protocol        |                Header Checksum                | <----- Нам требуется залогировать Protocol отсюда,
+// +---------------------------------------------------------------------------------------------------------------+
+// |  12   |  96   |                                       Source IP Address                                       |
+// +---------------------------------------------------------------------------------------------------------------+
+// |  16   |  128  |                                    Destination IP Address                                     |
+// +---------------------------------------------------------------------------------------------------------------+
+// |  20   |  160  |                                     Options (if IHL > 5)                                      |
+// +---------------------------------------------------------------------------------------------------------------+
+// |  24   |  192  |                                                                                               |
+// |  30   |  224  |                                            Payload                                            | <----- Здесь лежит PDU(protocol data unit), который надо декапсулировать
+// |  ...  |  ...  |                                                                                               |
+// +---------------------------------------------------------------------------------------------------------------+
+//
+// UDP data unit (datagram):
+// +---------------------------------------------------------------------------------------------------------------+
+// |       | Octet |           0           |           1           |           2           |           3           |
+// | Octet |  Bit  |00|01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|
+// +---------------------------------------------------------------------------------------------------------------+
+// |   0   |   0   |                   source port                 |                 destination port              | <------ Залогируем порты
+// +---------------------------------------------------------------------------------------------------------------+
+// |   4   |  32   |                     Length                    |                     checksum                  |
+// +---------------------------------------------------------------------------------------------------------------+
+// |   8   |  64   |                                                                                               |
+// |  12   |  96   |                                            Payload                                            |
+// |  ...  |  ...  |                                                                                               |
+// +---------------------------------------------------------------------------------------------------------------+
+//
+
 // runTunApp Поднимает tun интерфейс и отправляет туда трафик, сами пакеты из тоннеля считывается, парсится протокол,
 // от кого и кому, по каким портам, логируется полученная информация и байты самого пакета.
 //
-// Будет выполнено:
-//  1. Поднять tun интерфейс.
-//  2. Направлять трафик в интерфейс.
-//  3. Считывать пакеты из интерфейса:
+// Функция в себе содержит:
+//  1. Создание tun интерфейса.
+//  2. Генерация трафика на девайсе.
+//  3. Чтение трафика:
 //     3.1. Получить информацию из пакета: Используемый протокол; Какие порты используются.
 //     3.2. Залогировать полученную информацию и содержимое пакета (байты).
 func runTunApp() (err error) {
@@ -57,53 +102,15 @@ func runTunApp() (err error) {
 	//	return fmt.Errorf("initConn: %v", err)
 	//}
 	// Начать вычитывать трафик
-	go readFrames(ifce)
+	//go readPackets(ifce)
+	readPackets(ifce)
 	// Начать писать трафик
-	//write(conn)
-	writeFrames(ifce)
 
 	return nil
 }
 
-func writeFrames(ifce *water.Interface) {
-	for range 10 {
-		time.Sleep(1 * time.Second)
-		b := []byte(uuid.NewString())
-		n, err := ifce.Write(b)
-		if err != nil {
-			log.Printf("ERROR writeFrames: ifce.Write: %v", err)
-		}
-		log.Printf("INFO writeFrames: ifce.Write: written %d bytes: % x", n, b)
-	}
-}
-
-func write(conn net.Conn) {
-	for range 10 {
-		time.Sleep(1 * time.Second)
-		data := uuid.NewString()
-		n, err := fmt.Fprintf(conn, data)
-		if err != nil {
-			log.Printf("ERROR write: fmt.Fprintf: %v", err)
-			continue
-		}
-		log.Printf("INFO wrote frame: %d bytes: % x", n, data)
-	}
-}
-
-//func write(conn net.Conn) {
-//	for range 10 {
-//		time.Sleep(1 * time.Second)
-//		b := []byte(uuid.NewString())
-//		n, err := conn.Write(b)
-//		if err != nil {
-//			log.Printf("ERROR write: conn.Write: %v", err)
-//		}
-//		log.Printf("INFO wrote UDP frames: %d bytes: % x", n, b)
-//	}
-//}
-
 func initConn() (net.Conn, error) {
-	conn, err := net.Dial("udp", ifceIP+":42224")
+	conn, err := net.Dial("udp", ifceIP+":53333")
 	if err != nil {
 		return nil, fmt.Errorf("net.Dial: %v", err)
 	}
@@ -148,39 +155,44 @@ func setupIfce(ifce *water.Interface) error {
 	return nil
 }
 
-// readFrames читает пачками
-func readFrames(ifce *water.Interface) {
-	var frame ethernet.Frame
+// readPackets читает трафик
+func readPackets(ifce *water.Interface) {
+	buf := make([]byte, MTU)
 	for {
-		frame.Resize(MTU)
-		n, err := ifce.Read(frame)
+		n, err := ifce.Read(buf)
 		if err != nil {
-			log.Printf("ERROR readFrames: %v", err)
+			log.Printf("ERROR readPackets: %v", err)
 			continue
 		}
-		frame = frame[:n]
-		logNewFrame(frame)
+		data := buf[:n]
+		if !waterutil.IsIPv4(buf) {
+			continue
+		}
+		logNewFrame(data)
 	}
 }
 
 // logNewFrame логирует некоторые данные фрейма
 func logNewFrame(frame ethernet.Frame) {
 	p := waterutil.IPv4Protocol(frame)
-	//log.Printf("Протокол: %x (%s)\n", p, protocolName[p])
+	//log.Printf("Протокол: %x (%s)\n", p, tlProtocolName[p])
 	//log.Printf("Порт назначения: %d\n", waterutil.IPv4DestinationPort(frame))
 	//log.Printf("Порт источника: %d\n", waterutil.IPv4SourcePort(frame))
 	//log.Printf("Данные: % x\n", frame.Payload())
+
 	slog.Info(
 		"logNewFrame",
-		slog.String("Протокол", protocolName[p]),
-		slog.Int("Порт назначения", int(waterutil.IPv4DestinationPort(frame))),
-		slog.Int("Порт источника", int(waterutil.IPv4SourcePort(frame))),
+		slog.String("Протокол", tlProtocolName[p]),
+		slog.String("назначения", frame.Destination().String()),
+		slog.String("источника", frame.Source().String()),
+		//slog.Int("Порт назначения", int(waterutil.IPv4DestinationPort(frame))),
+		//slog.Int("Порт источника", int(waterutil.IPv4SourcePort(frame))),
 		slog.String("Данные", fmt.Sprintf("% x", frame.Payload())),
 	)
 }
 
-// readFrames человеко-понятные названия протоколов
-var protocolName = map[waterutil.IPProtocol]string{
+// tlProtocolName человеко-понятные названия протоколов транспортного уровня
+var tlProtocolName = map[waterutil.IPProtocol]string{
 	0x00: "HOPOPT",
 	0x01: "ICMP",
 	0x02: "IGMP",
@@ -320,4 +332,10 @@ var protocolName = map[waterutil.IPProtocol]string{
 //	https://github.com/roundliuyang/Computer-Network/blob/3d581ce3dbf41a9ba87cfa82cb510599310c5290/Linux%20%E5%86%85%E6%A0%B8%E7%BD%91%E7%BB%9C%E6%8A%80%E6%9C%AF/VPN%20%E5%8E%9F%E7%90%86.md?plain=1#L90
 // A simple TUN/TAP library written in native Go:
 //	https://github.com/songgao/water
+// Модель OSI | Введение в сети. Часть 2:
+// 	https://youtu.be/YX3lWjNu58k?si=11U-PfH9GjLydtS1
+// Модель TCP/IP | Введение в сети. Часть 3:
+// 	https://youtu.be/XGiezoHclP8?si=v89iVMdgXjZa0xne
+// КАК УСТРОЕН TCP/IP?:
+// 	https://youtu.be/EJzitviiv2c?si=BgFavllcnYG8Fla8
 //
