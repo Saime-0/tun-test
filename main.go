@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"log/slog"
 	"net"
 	"os/exec"
 	"runtime"
+	"time"
 
 	"github.com/songgao/packets/ethernet"
 	"github.com/songgao/water"
@@ -17,17 +19,28 @@ func main() {
 	if runtime.GOOS != "linux" {
 		log.Fatalf("%s is not supported on this platform", runtime.GOOS)
 	}
+
+	//ctx, cancel := context.WithCancel(context.Background())
+	//go func() {
+	//	c := make(chan os.Signal)
+	//	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	//	<-c
+	//	cancel()
+	//	time.Sleep(2 * time.Second)
+	//	log.Print("exit by timeout")
+	//	os.Exit(0)
+	//}()
+
 	if err := runTunApp(); err != nil {
 		log.Fatal("runTunApp: ", err.Error())
 	}
 }
 
 const (
-	MTU        = 1500
-	ifceName   = "tun250413"
-	ifceIP     = "10.1.0.10"
-	ifceIPMask = "24"
-	ifceCIDR   = ifceIP + "/" + ifceIPMask
+	MTU      = 1500 // Размер ipv4 пакетов
+	ifceName = "tun250413"
+	ifceIP   = "10.1.0.10"
+	ifceCIDR = ifceIP + "/24"
 )
 
 // ======= Модель TCP/IP =======
@@ -49,7 +62,7 @@ const (
 // +---------------------------------------------------------------------------------------------------------------+
 // |   4   |  32   |                Identification                 | Flags  |           Fragment Offset            |
 // +---------------------------------------------------------------------------------------------------------------+
-// |   8   |  64   |     Time To Live      |       Protocol        |                Header Checksum                | <----- Нам требуется залогировать Protocol отсюда,
+// |   8   |  64   |     Time To Live      |       Protocol        |                Header Checksum                | <----- Нам требуется залогировать Protocol транспортного уровня
 // +---------------------------------------------------------------------------------------------------------------+
 // |  12   |  96   |                                       Source IP Address                                       |
 // +---------------------------------------------------------------------------------------------------------------+
@@ -59,7 +72,7 @@ const (
 // +---------------------------------------------------------------------------------------------------------------+
 // |  24   |  192  |                                                                                               |
 // |  30   |  224  |                                            Payload                                            | <----- Здесь лежит PDU(protocol data unit), который надо декапсулировать
-// |  ...  |  ...  |                                                                                               |
+// |  ...  |  ...  | <--- максимум 1500 октетов (байт)                                                             |
 // +---------------------------------------------------------------------------------------------------------------+
 //
 // UDP data unit (datagram):
@@ -67,7 +80,7 @@ const (
 // |       | Octet |           0           |           1           |           2           |           3           |
 // | Octet |  Bit  |00|01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|
 // +---------------------------------------------------------------------------------------------------------------+
-// |   0   |   0   |                   source port                 |                 destination port              | <------ Залогируем порты
+// |   0   |   0   |                   source port                 |                 destination port              | <----- Нам требуется залогировать порты
 // +---------------------------------------------------------------------------------------------------------------+
 // |   4   |  32   |                     Length                    |                     checksum                  |
 // +---------------------------------------------------------------------------------------------------------------+
@@ -96,26 +109,42 @@ func runTunApp() (err error) {
 	if err = setupIfce(ifce); err != nil {
 		return fmt.Errorf("setupIfce: %v", err)
 	}
-	// Инициализировать подключение
-	//conn, err := initConn()
-	//if err != nil {
-	//	return fmt.Errorf("initConn: %v", err)
-	//}
-	// Начать вычитывать трафик
-	//go readPackets(ifce)
-	readPackets(ifce)
-	// Начать писать трафик
 
-	return nil
+	// Запустить чтение трафика
+	go readPacketsUDP4(ifce)
+	// Запустить запись трафика
+	go writePacketsUDP4(ifce)
+
+	return <-make(chan error)
 }
 
-func initConn() (net.Conn, error) {
-	conn, err := net.Dial("udp", ifceIP+":53333")
+func writePacketsUDP4(ifce *water.Interface) {
+	//laddr, err := net.ResolveUDPAddr("udp4", ":51442")
+	//if err != nil {
+	//	log.Fatalf("writePacketsUDP4: net.ResolveUDPAddr: %v", err)
+	//}
+	//raddr, err := net.ResolveUDPAddr("udp4", ifceIP+":51443")
+	//if err != nil {
+	//	log.Fatalf("writePacketsUDP4: net.ResolveUDPAddr: %v", err)
+	//}
+	conn, err := net.DialUDP(
+		"udp",
+		&net.UDPAddr{Port: 51442},
+		&net.UDPAddr{IP: net.ParseIP(ifceIP), Port: 51443},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("net.Dial: %v", err)
+		log.Fatalf("writePacketsUDP4: net.Dial: %v", err)
 	}
-
-	return conn, err
+	var i int
+	for {
+		if n, err := conn.Write([]byte("hi")); err != nil {
+			log.Printf("ERROR writePacketsUDP4: conn.Write seq=%d: %v", i, err)
+		} else {
+			log.Printf("INFO writePacketsUDP4: conn.Write seq=%d: written bytes=%d", i, n)
+		}
+		i++
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // initTunIfce создает виртуальные сетевые интерфейс типа TUN
@@ -155,44 +184,83 @@ func setupIfce(ifce *water.Interface) error {
 	return nil
 }
 
-// readPackets читает трафик
-func readPackets(ifce *water.Interface) {
+// readPacketsUDP4 читает трафик
+func readPacketsUDP4(ifce *water.Interface) {
 	buf := make([]byte, MTU)
 	for {
 		n, err := ifce.Read(buf)
 		if err != nil {
-			log.Printf("ERROR readPackets: %v", err)
+			log.Printf("ERROR readPacketsUDP4: %v", err)
 			continue
 		}
 		data := buf[:n]
-		if !waterutil.IsIPv4(buf) {
-			continue
+		packet := packetIPv4FromBytes(data)
+		log.Printf("INFO readPacketsUDP4: packetIPv4=%v", packet)
+		if packet.protocol == "udp" {
+			datagram := datagramUDPFromBytes(packet.payload)
+			log.Printf("INFO readPacketsUDP4: packetIPv4.datagramUDP=%v", datagram)
 		}
-		logNewFrame(data)
 	}
 }
 
-// logNewFrame логирует некоторые данные фрейма
-func logNewFrame(frame ethernet.Frame) {
-	p := waterutil.IPv4Protocol(frame)
+// packetIPv4 содержит некоторые данные пакета
+type packetIPv4 struct {
+	protocol string
+	payload  []byte
+}
+
+func packetIPv4FromBytes(b []byte) packetIPv4 {
+	packet := packetIPv4{
+		protocol: tlProtocolName[b[9]],
+	}
+	if len(b) >= 25 {
+		packet.payload = b[24:]
+		//packet.payload = b[24:min(len(b), MTU)]
+	}
+
+	return packet
+}
+
+// datagramUDP содержит некоторые данные датаграммы
+type datagramUDP struct {
+	sourcePort      int
+	destinationPort int
+	payload         []byte
+}
+
+func datagramUDPFromBytes(b []byte) datagramUDP {
+	datagram := datagramUDP{
+		sourcePort:      int(binary.BigEndian.Uint16(b[0:2])),
+		destinationPort: int(binary.BigEndian.Uint16(b[2:4])),
+	}
+	if len(b) >= 9 {
+		datagram.payload = b[9:]
+	}
+
+	return datagram
+}
+
+// logPacketIPv4 логирует некоторые данные пакета
+func logPacketIPv4(frame ethernet.Frame) {
+	//p := waterutil.IPv4Protocol(frame)
 	//log.Printf("Протокол: %x (%s)\n", p, tlProtocolName[p])
 	//log.Printf("Порт назначения: %d\n", waterutil.IPv4DestinationPort(frame))
 	//log.Printf("Порт источника: %d\n", waterutil.IPv4SourcePort(frame))
 	//log.Printf("Данные: % x\n", frame.Payload())
 
 	slog.Info(
-		"logNewFrame",
-		slog.String("Протокол", tlProtocolName[p]),
-		slog.String("назначения", frame.Destination().String()),
-		slog.String("источника", frame.Source().String()),
-		//slog.Int("Порт назначения", int(waterutil.IPv4DestinationPort(frame))),
-		//slog.Int("Порт источника", int(waterutil.IPv4SourcePort(frame))),
+		"logPacketIPv4",
+		//slog.String("Протокол", tlProtocolName[p]),
+		//slog.String("назначения", frame.Destination().String()),
+		//slog.String("источника", frame.Source().String()),
+		slog.Int("Порт назначения", int(waterutil.IPv4DestinationPort(frame))),
+		slog.Int("Порт источника", int(waterutil.IPv4SourcePort(frame))),
 		slog.String("Данные", fmt.Sprintf("% x", frame.Payload())),
 	)
 }
 
 // tlProtocolName человеко-понятные названия протоколов транспортного уровня
-var tlProtocolName = map[waterutil.IPProtocol]string{
+var tlProtocolName = map[byte]string{
 	0x00: "HOPOPT",
 	0x01: "ICMP",
 	0x02: "IGMP",
