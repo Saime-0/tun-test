@@ -1,0 +1,32 @@
+# https://taskfile.dev/usage/
+version: '3'
+
+
+tasks:
+  test:
+    cmds:
+      - go test ./...
+
+  vet:
+    cmds:
+      - go vet ./...
+
+  lint:
+    vars:
+      CORES:
+        sh: echo $(( $(nproc) - 1 ))
+    cmds:
+      - golangci-lint run -v -j {{.CORES}}
+
+  check:
+    deps: [vet, lint]
+
+  run:
+    cmds:
+      - go run ./cmd/auth-api/main.go
+
+  build:
+    env:
+      CGO_ENABLED: 0
+    cmds:
+      - go build -o bin/auth-api cmd/auth-api/main.go
